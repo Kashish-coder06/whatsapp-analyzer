@@ -2145,9 +2145,68 @@ def reset_chat_data():
     reset_bot_messages()
     st.rerun()
 
+DEFAULT_SAMPLE_ANDROID = """12/03/2024, 9:00 am - Messages and calls are end-to-end encrypted. No one outside of this chat, not even WhatsApp, can read or listen to them.
+12/03/2024, 9:02 am - Ali: Assalam o Alaikum sab ko! 👋
+12/03/2024, 9:03 am - Bilal: Walaikum Assalam Ali bhai! Kaise ho?
+12/03/2024, 9:05 am - Sara: Hey everyone! Project discussion start karein?
+12/03/2024, 9:06 am - Ali: Haan bilkul, maine requirements document upload kar diya hai.
+Ye link check karo:
+https://github.com/developer/whatsapp-analyzer
+12/03/2024, 9:10 am - Sara: Zabardast! Python aur Streamlit ka UI kaisa rahega? 👍🏽
+12/03/2024, 9:12 am - Bilal: Boht behtareen ideas hain. React se zyada easy to deploy hai.
+12/03/2024, 9:15 am - Ali: <Media omitted>
+12/03/2024, 9:16 am - Bilal: <Media omitted>
+12/03/2024, 2:30 pm - Sara: Meeting 3:00 PM pe rakhein? ☕
+12/03/2024, 2:35 pm - Ali: Perfect! Main Google Meet link bhejta hoon:
+https://meet.google.com/abc-defg-hij
+12/03/2024, 2:36 pm - Bilal: Main join kar loonga.
+12/03/2024, 2:40 pm - Sara: 🇵🇰 ❤️
+13/03/2024, 10:00 am - Ali: Good morning team! Yesterday's progress was super awesome.
+13/03/2024, 10:15 am - Sara: Yes! Aaj word cloud and heatmap integrate karna hai.
+13/03/2024, 10:20 am - Bilal: Check this YouTube tutorial for Plotly heatmaps:
+https://youtube.com/watch?v=sample123
+13/03/2024, 10:25 am - Ali: Thanks Bilal bhai, boht useful video hai! 🚀
+13/03/2024, 4:00 pm - Sara: <Media omitted>
+13/03/2024, 4:05 pm - Ali: Wah kya designs hain! 👏
+14/03/2024, 11:30 am - Bilal: Project ready hai review ke liye.
+14/03/2024, 11:35 am - Sara: Testing done! No errors found. 🎉
+14/03/2024, 11:40 am - Ali: Mubarak ho sab ko! Party banti hai ab. 🥳 🔥"""
+
+DEFAULT_SAMPLE_IOS = """[15/03/2024, 9:00:15 AM] Messages and calls are end-to-end encrypted.
+[15/03/2024, 9:01:20 AM] Hamza: Hey team! Welcome to the iOS exported chat. 🚀
+[15/03/2024, 9:03:10 AM] Ayesha: Good morning Hamza! Did you test the emoji extractor?
+[15/03/2024, 9:04:00 AM] Hamza: Yes, works with flags 🇵🇰 and emojis like 👨‍👩‍👧 and skin tones 👍🏽!
+[15/03/2024, 9:05:30 AM] Ayesha: image omitted
+[15/03/2024, 9:06:00 AM] Hamza: Looks clean. Checkout the docs on https://streamlit.io and https://plotly.com
+[15/03/2024, 3:30:00 PM] Ayesha: Reply time and streaks are accurately calculating now.
+[15/03/2024, 3:32:15 PM] Hamza: Exactly! Longest streak is looking great.
+[16/03/2024, 11:00:00 AM] Ayesha: Ready for launch! ✨ 🎉"""
+
 def load_sample(filepath: str, name: str):
-    with open(filepath, "r", encoding="utf-8") as f:
-        content = f.read()
+    content = None
+    # 1. Search candidate locations: relative to script dir, current dir, and direct path
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base_dir, filepath),
+        filepath,
+        os.path.join(os.getcwd(), filepath)
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    content = f.read()
+                break
+            except Exception:
+                pass
+
+    # 2. Resilient fallback to embedded demo chats (e.g. on Streamlit Cloud or containerized deployments)
+    if not content:
+        if "ios" in filepath.lower() or "ios" in name.lower():
+            content = DEFAULT_SAMPLE_IOS
+        else:
+            content = DEFAULT_SAMPLE_ANDROID
+
     st.session_state.chat_filename = name
     st.session_state.is_demo = True
     st.session_state.parse_result = parse_chat_file(content, filename=name)
