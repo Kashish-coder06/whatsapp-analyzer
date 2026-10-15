@@ -1,0 +1,30 @@
+﻿# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary / test media
+*.png
+*.jpg
+*.jpeg
+*.docx
+dump_page.html
+.tempmediaStorage/
+*.log
