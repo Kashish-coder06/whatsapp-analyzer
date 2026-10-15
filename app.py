@@ -13,27 +13,38 @@ import sys
 import zipfile
 
 # Ensure current repository root is in Python sys.path on Streamlit Cloud & remote servers
-_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-# Auto-extract package if uploaded as zip to GitHub/Streamlit Cloud
-_PKG_DIR = os.path.join(_REPO_ROOT, "whatsapp_analyzer")
-_ZIP_FILE = os.path.join(_REPO_ROOT, "whatsapp_chat_analyzer_deploy.zip")
-if not os.path.exists(_PKG_DIR) and os.path.exists(_ZIP_FILE):
-    try:
-        with zipfile.ZipFile(_ZIP_FILE, "r") as _z:
-            _z.extractall(_REPO_ROOT)
-    except Exception:
-        pass
-import io
-import json
-import base64
+import os
 import sys
-import html
-import textwrap
-import re
-from datetime import datetime, date
+import tempfile
+import zipfile
+
+# 1. Add current directory to sys.path
+_CUR_DIR = os.path.dirname(os.path.abspath(__file__))
+if _CUR_DIR not in sys.path:
+    sys.path.insert(0, _CUR_DIR)
+if os.getcwd() not in sys.path:
+    sys.path.insert(0, os.getcwd())
+
+# 2. In-Memory Direct ZipImport (No disk permissions needed on Streamlit Cloud)
+_ZIP_CANDIDATES = [
+    os.path.join(_CUR_DIR, "whatsapp_chat_analyzer_deploy.zip"),
+    os.path.join(os.getcwd(), "whatsapp_chat_analyzer_deploy.zip"),
+    "whatsapp_chat_analyzer_deploy.zip"
+]
+for _cand in _ZIP_CANDIDATES:
+    if os.path.exists(_cand):
+        _abs_cand = os.path.abspath(_cand)
+        if _abs_cand not in sys.path:
+            sys.path.insert(0, _abs_cand)
+        try:
+            _tmp_dir = os.path.join(tempfile.gettempdir(), "wa_extracted")
+            os.makedirs(_tmp_dir, exist_ok=True)
+            with zipfile.ZipFile(_cand, "r") as _z:
+                _z.extractall(_tmp_dir)
+            if _tmp_dir not in sys.path:
+                sys.path.insert(0, _tmp_dir)
+        except Exception:
+            pass
 import streamlit as st
 
 # Automatically invalidate stale subpackage cache on re-runs
