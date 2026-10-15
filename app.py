@@ -8,67 +8,1029 @@ Matches the exact pixel layout from the reference image (media_1792003835526.png
 - Full-bleed Bottom Dark Teal Banner (#075E54) with Instant Insights summary text
 - Full WhatsApp Dashboard with Overview, Participants, Sentiments & Words, Activity, Chat Breakdown
 """
+# -*- coding: utf-8 -*-
 import os
 import sys
-import zipfile
-
-# Ensure current repository root is in Python sys.path on Streamlit Cloud & remote servers
-import os
-import sys
-import tempfile
-import zipfile
-
-# 1. Add current directory to sys.path
-_CUR_DIR = os.path.dirname(os.path.abspath(__file__))
-if _CUR_DIR not in sys.path:
-    sys.path.insert(0, _CUR_DIR)
-if os.getcwd() not in sys.path:
-    sys.path.insert(0, os.getcwd())
-
-# 2. In-Memory Direct ZipImport (No disk permissions needed on Streamlit Cloud)
-_ZIP_CANDIDATES = [
-    os.path.join(_CUR_DIR, "whatsapp_chat_analyzer_deploy.zip"),
-    os.path.join(os.getcwd(), "whatsapp_chat_analyzer_deploy.zip"),
-    "whatsapp_chat_analyzer_deploy.zip"
-]
-for _cand in _ZIP_CANDIDATES:
-    if os.path.exists(_cand):
-        _abs_cand = os.path.abspath(_cand)
-        if _abs_cand not in sys.path:
-            sys.path.insert(0, _abs_cand)
-        try:
-            _tmp_dir = os.path.join(tempfile.gettempdir(), "wa_extracted")
-            os.makedirs(_tmp_dir, exist_ok=True)
-            with zipfile.ZipFile(_cand, "r") as _z:
-                _z.extractall(_tmp_dir)
-            if _tmp_dir not in sys.path:
-                sys.path.insert(0, _tmp_dir)
-        except Exception:
-            pass
-import streamlit as st
-
-# Automatically invalidate stale subpackage cache on re-runs
-for mod_name in list(sys.modules.keys()):
-    if mod_name.startswith("whatsapp_analyzer"):
-        del sys.modules[mod_name]
-
+import html
+import textwrap
+import re
+from datetime import datetime, date, timedelta
+from typing import List, Optional, Tuple, Dict, Any
+from collections import Counter, defaultdict
+from urllib.parse import urlparse
+import io
+import emoji
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
+import streamlit as st
 
-from whatsapp_analyzer.models import Message, ParseResult
-from whatsapp_analyzer.parser import parse_chat_file
-from whatsapp_analyzer.analyzers import (
-    analyze_chat,
-    SearchAnalyzer,
-    UserAnalyzer,
-    TimelineAnalyzer,
-    MediaAnalyzer,
-    SentimentAnalyzer,
-    ComparisonAnalyzer
+
+# ==============================================================================
+# EMBEDDED ZERO-DEPENDENCY WHATSAPP ANALYTICS ENGINE
+# ==============================================================================
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Optional
+
+@dataclass
+class Message:
+    id: int
+    datetime: datetime
+    sender: str
+    text: str
+    is_media: bool = False
+    media_type: Optional[str] = None  # "image", "video", "audio", "sticker", "document", "other"
+    is_system: bool = False
+    links: List[str] = field(default_factory=list)
+    emojis: List[str] = field(default_factory=list)
+
+    # Derived attributes computed once for fast filtering
+    hour: int = 0
+    weekday: int = 0  # 0=Monday, 6=Sunday
+    weekday_name: str = ""
+    month: int = 1
+    month_name: str = ""
+    year: int = 2000
+    date_str: str = ""
+    year_month: str = ""
+    char_count: int = 0
+    word_count: int = 0
+
+    def __post_init__(self):
+        if self.datetime:
+            self.hour = self.datetime.hour
+            self.weekday = self.datetime.weekday()
+            self.weekday_name = self.datetime.strftime("%A")
+            self.month = self.datetime.month
+            self.month_name = self.datetime.strftime("%B")
+            self.year = self.datetime.year
+            self.date_str = self.datetime.strftime("%Y-%m-%d")
+            self.year_month = self.datetime.strftime("%Y-%m")
+        if self.text and not self.is_media and not self.is_system:
+            self.char_count = len(self.text)
+            self.word_count = len(self.text.split())
+
+@dataclass
+class ParseResult:
+    status: str  # "ok", "ambiguous-date", "error"
+    messages: List[Message] = field(default_factory=list)
+    participants: List[str] = field(default_factory=list)
+    sample: Optional[str] = None
+    error_message: Optional[str] = None
+    date_order: Optional[str] = None  # "DMY" or "MDY"
+    platform: Optional[str] = None    # "android" or "ios"
+
+@dataclass
+class ChatStats:
+    total_messages: int
+    total_words: int
+    media_count: int
+    link_count: int
+    start_date: Optional[datetime]
+    end_date: Optional[datetime]
+    total_days: int
+    avg_messages_per_day: float
+
+import re
+
+# Invisible Unicode characters often injected by WhatsApp/mobile OS
+INVISIBLE_CHARS = [
+    "\u200e",  # Left-to-Right Mark (LRM)
+    "\u200f",  # Right-to-Left Mark (RLM)
+    "\ufeff",  # Zero-width no-break space / BOM
+    "\u200b",  # Zero-width space
+    "\u200c",  # Zero-width non-joiner (unless in script text, handled safely)
+    "\u200d",  # Zero-width joiner in isolation
+    "\u2060",  # Word joiner
+]
+
+# Non-standard spaces to normalize to standard ASCII space
+SPACE_NORMALIZATION = {
+    "\u202f": " ",  # Narrow no-break space (standard in iOS AM/PM timestamps)
+    "\u00a0": " ",  # Non-breaking space
+    "\u2009": " ",  # Thin space
+    "\u2008": " ",  # Punctuation space
+    "\u2002": " ",  # En space
+    "\u2003": " ",  # Em space
+}
+
+def clean_text(raw_text: str) -> str:
+    """Clean exported WhatsApp chat text.
+    
+    1. Normalizes newlines (\r\n -> \n)
+    2. Strips BOM and leading/trailing invisible control marks
+    3. Normalizes narrow non-breaking spaces
+    """
+    if not raw_text:
+        return ""
+    
+    # Normalize newlines
+    text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    
+    # Replace non-standard spaces
+    for weird_space, normal_space in SPACE_NORMALIZATION.items():
+        text = text.replace(weird_space, normal_space)
+        
+    # Remove invisible directional and zero-width markers
+    for char in ["\u200e", "\u200f", "\ufeff", "\u2060"]:
+        text = text.replace(char, "")
+        
+    return text
+
+import re
+from urllib.parse import urlparse
+from typing import List, Tuple
+import emoji
+
+# Robust URL regex that captures http, https, and www links
+URL_PATTERN = re.compile(
+    r'(?:https?:\/\/|www\.)[^\s<>"]+[^\s<>".,;:\'\?!)]',
+    re.IGNORECASE
 )
+
+def extract_urls(text: str) -> List[str]:
+    """Extract all URLs from a text string."""
+    if not text:
+        return []
+    urls = URL_PATTERN.findall(text)
+    # Ensure all urls have a scheme for clean domain parsing
+    normalized = []
+    for u in urls:
+        if not u.startswith("http://") and not u.startswith("https://"):
+            normalized.append("http://" + u)
+        else:
+            normalized.append(u)
+    return normalized
+
+def extract_domains(urls: List[str]) -> List[str]:
+    """Extract netloc/domain name from a list of URLs (e.g. youtube.com)."""
+    domains = []
+    for u in urls:
+        try:
+            parsed = urlparse(u)
+            domain = parsed.netloc.lower()
+            if domain.startswith("www."):
+                domain = domain[4:]
+            if domain:
+                domains.append(domain)
+        except Exception:
+            continue
+    return domains
+
+def extract_emojis(text: str) -> List[str]:
+    """Extract all emojis from text, preserving ZWJ, skin tones, and flag sequences."""
+    if not text:
+        return []
+    
+    # Use emoji library's emoji_list which accurately handles compound emojis and variants
+    try:
+        found = emoji.emoji_list(text)
+        return [item['emoji'] for item in found]
+    except Exception:
+        # Fallback to regex if emoji library encounters unexpected token
+        import regex
+        # Unicode 15.1 compliant emoji pattern
+        emoji_pattern = regex.compile(r'\X', regex.UNICODE)
+        return [c for c in emoji_pattern.findall(text) if any(char in emoji.EMOJI_DATA for char in c)]
+
+ENGLISH_STOPWORDS = {
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
+    "any", "are", "aren't", "as", "at", "be", "because", "been", "before", "being",
+    "below", "between", "both", "but", "by", "can't", "cannot", "could", "couldn't",
+    "did", "didn't", "do", "does", "doesn't", "doing", "don't", "down", "during",
+    "each", "few", "for", "from", "further", "had", "hadn't", "has", "hasn't",
+    "have", "haven't", "having", "he", "he'd", "he'll", "he's", "her", "here",
+    "here's", "hers", "herself", "him", "himself", "his", "how", "how's", "i",
+    "i'd", "i'll", "i'm", "i've", "if", "in", "into", "is", "isn't", "it",
+    "it's", "its", "itself", "let's", "me", "more", "most", "mustn't", "my",
+    "myself", "no", "nor", "not", "of", "off", "on", "once", "only", "or",
+    "other", "ought", "our", "ours", "ourselves", "out", "over", "own", "same",
+    "shan't", "she", "she'd", "she'll", "she's", "should", "shouldn't", "so",
+    "some", "such", "than", "that", "that's", "the", "their", "theirs", "them",
+    "themselves", "then", "there", "there's", "these", "they", "they'd", "they'll",
+    "they're", "they've", "this", "those", "through", "to", "too", "under",
+    "until", "up", "very", "was", "wasn't", "we", "we'd", "we'll", "we're",
+    "we've", "were", "weren't", "what", "what's", "when", "when's", "where",
+    "where's", "which", "while", "who", "who's", "whom", "why", "why's", "with",
+    "won't", "would", "wouldn't", "you", "you'd", "you'll", "you're", "you've",
+    "your", "yours", "yourself", "yourselves", "ok", "okay", "yeah", "yes", "no",
+    "bro", "sir", "mam", "pls", "please", "thanks", "thank", "thx"
+}
+
+ROMAN_URDU_STOPWORDS = {
+    # Pronouns & pointers
+    "mai", "main", "me", "mera", "meri", "mere", "mujhe", "mujh",
+    "tum", "tumhe", "tumhari", "tumhara", "tumhare", "tu", "tujhe", "tera", "teri", "tere",
+    "aap", "ap", "aapka", "aapki", "aapke", "apka", "apki", "apke", "unka", "unki", "unke",
+    "yeh", "ye", "woh", "wo", "is", "us", "in", "un", "isse", "usse", "inka", "inka",
+    # Helping verbs / verbs
+    "hai", "hain", "ho", "hoon", "hun", "tha", "thi", "the", "thay",
+    "hoga", "hogi", "honge", "hota", "hoti", "hote", "hua", "hui", "hue", "huye",
+    "kar", "karo", "karna", "karni", "karne", "karta", "karti", "karte", "kiya", "kiye", "kya",
+    "raha", "rahi", "rahe", "gaya", "gayi", "gaye", "aaya", "aayi", "aaye", "aana", "jana",
+    # Prepositions, conjunctions, particles
+    "ka", "ki", "ke", "ko", "se", "mein", "me", "pe", "par", "pa", "tak", "saath",
+    "aur", "ya", "lekin", "magar", "per", "bhi", "hi", "to", "tou", "toh", "so",
+    "ne", "na", "nahi", "nahin", "nhi", "mat",
+    # Question & common filler words
+    "kya", "kyun", "kyu", "kab", "kahan", "kidhar", "kaise", "kese", "kitna", "kitni", "kitne",
+    "kaun", "kon", "kisko", "kis",
+    "acha", "achha", "accha", "theek", "thik", "sahi", "haan", "han", "hnn", "hmm", "hm",
+    "bhai", "yaar", "yr", "yar", "ab", "jab", "tab", "phir", "fir", "baad", "pehle",
+    "kuch", "kuchh", "koi", "sab", "bohot", "boht", "bahut", "zyada", "ziada", "kam",
+    "bas", "sirf", "batao", "bata", "dekh", "dekho", "sun", "suno", "chalo", "chlo"
+}
+
+# WhatsApp specific omitted text and noise words
+MEDIA_NOISE_WORDS = {
+    "media", "omitted", "image", "video", "audio", "document", "sticker",
+    "contact", "card", "location", "live", "deleted", "message", "call", "voice"
+}
+
+ALL_STOPWORDS = ENGLISH_STOPWORDS.union(ROMAN_URDU_STOPWORDS).union(MEDIA_NOISE_WORDS)
+
+import io
+import re
+import zipfile
+from datetime import datetime
+from typing import List, Optional, Tuple, Dict, Any
+
+# (embedded models)
+# (embedded cleaner)
+# (embedded extractors)
+
+# Detailed media classifications
+MEDIA_TYPE_MAP = [
+    (re.compile(r"image\s+omitted|photo\s+omitted", re.IGNORECASE), "Image"),
+    (re.compile(r"video\s+omitted", re.IGNORECASE), "Video"),
+    (re.compile(r"audio\s+omitted|voice\s+message\s+omitted", re.IGNORECASE), "Audio"),
+    (re.compile(r"sticker\s+omitted", re.IGNORECASE), "Sticker"),
+    (re.compile(r"document\s+omitted", re.IGNORECASE), "Document"),
+    (re.compile(r"gif\s+omitted", re.IGNORECASE), "GIF"),
+    (re.compile(r"contact\s+card\s+omitted", re.IGNORECASE), "Contact"),
+    (re.compile(r"<\s*media\s+omitted\s*>", re.IGNORECASE), "Media"),
+]
+
+# Patterns for message lines
+ANDROID_LINE_PATTERN = re.compile(
+    r"^(\d{1,4}[/\-.]\d{1,2}[/\-.]\d{2,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[a-zA-Z]{2})?)\s*-\s*(.*)$"
+)
+
+IOS_LINE_PATTERN = re.compile(
+    r"^\[(\d{1,4}[/\-.]\d{1,2}[/\-.]\d{2,4}),?\s+(\d{1,2}:\d{2}(?::\d{2})?(?:\s*[a-zA-Z]{2})?)\]\s*(.*)$"
+)
+
+def get_media_type(text: str) -> Optional[str]:
+    """Check if message is media placeholder and return category."""
+    clean = text.strip()
+    for pattern, m_type in MEDIA_TYPE_MAP:
+        if pattern.search(clean):
+            return m_type
+    if clean.lower() == "null":
+        return "Media"
+    return None
+
+def is_media_message(text: str) -> bool:
+    return get_media_type(text) is not None
+
+def detect_platform(raw_text: str) -> str:
+    """Detect whether file originates from Android or iOS based on headers."""
+    cleaned = clean_text(raw_text[:10000])
+    lines = cleaned.split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if IOS_LINE_PATTERN.match(line):
+            return "ios"
+        if ANDROID_LINE_PATTERN.match(line):
+            return "android"
+    return "android"
+
+def detect_date_order(raw_dates: List[str]) -> str:
+    """Determine whether dates are DD/MM or MM/DD by inspecting numbers > 12."""
+    has_first_gt_12 = False
+    has_second_gt_12 = False
+    
+    for date_str in raw_dates:
+        parts = re.split(r"[/\-.]", date_str.strip())
+        if len(parts) >= 2:
+            try:
+                p1 = int(parts[0])
+                p2 = int(parts[1])
+                if p1 > 12:
+                    has_first_gt_12 = True
+                if p2 > 12:
+                    has_second_gt_12 = True
+            except ValueError:
+                continue
+                
+    if has_first_gt_12 and not has_second_gt_12:
+        return "DMY"
+    elif has_second_gt_12 and not has_first_gt_12:
+        return "MDY"
+    if raw_dates and len(re.split(r"[/\-.]", raw_dates[0])) >= 3:
+        if len(re.split(r"[/\-.]", raw_dates[0])[0]) == 4:
+            return "YMD"
+            
+    return "AMBIGUOUS"
+
+def parse_datetime(date_str: str, time_str: str, date_order: str) -> Optional[datetime]:
+    """Parse date and time parts into datetime object."""
+    t_clean = time_str.strip().upper()
+    parts = re.split(r"[/\-.]", date_str.strip())
+    if len(parts) != 3:
+        return None
+    
+    try:
+        if date_order == "MDY":
+            month, day, year = int(parts[0]), int(parts[1]), int(parts[2])
+        elif date_order == "YMD":
+            year, month, day = int(parts[0]), int(parts[1]), int(parts[2])
+        else:  # Default to DMY
+            day, month, year = int(parts[0]), int(parts[1]), int(parts[2])
+            
+        if year < 100:
+            year += 2000
+            
+        is_pm = "PM" in t_clean
+        is_am = "AM" in t_clean
+        time_digits = re.sub(r"[^\d:]", "", t_clean)
+        time_parts = [int(p) for p in time_digits.split(":") if p]
+        
+        hour = time_parts[0]
+        minute = time_parts[1] if len(time_parts) > 1 else 0
+        second = time_parts[2] if len(time_parts) > 2 else 0
+        
+        if is_pm and hour < 12:
+            hour += 12
+        elif is_am and hour == 12:
+            hour = 0
+            
+        return datetime(year, month, day, hour, minute, second)
+    except Exception:
+        return None
+
+def parse_chat(raw_text: str, override_date_order: Optional[str] = None) -> ParseResult:
+    """Parse WhatsApp exported chat content into structured messages."""
+    if not raw_text or not raw_text.strip():
+        return ParseResult(
+            status="error",
+            error_message="The chat file is empty."
+        )
+        
+    cleaned_text = clean_text(raw_text)
+    lines = cleaned_text.split("\n")
+    
+    parsed_lines = []
+    collected_dates = []
+    platform = None
+    
+    for line in lines:
+        if not line.strip():
+            continue
+            
+        m_ios = IOS_LINE_PATTERN.match(line)
+        m_and = ANDROID_LINE_PATTERN.match(line)
+        
+        if m_ios:
+            if platform is None:
+                platform = "ios"
+            d_str, t_str, rest = m_ios.groups()
+            parsed_lines.append((d_str, t_str, rest, False))
+            collected_dates.append(d_str)
+        elif m_and:
+            if platform is None:
+                platform = "android"
+            d_str, t_str, rest = m_and.groups()
+            parsed_lines.append((d_str, t_str, rest, False))
+            collected_dates.append(d_str)
+        else:
+            if parsed_lines:
+                last_d, last_t, last_rest, last_is_cont = parsed_lines[-1]
+                parsed_lines[-1] = (last_d, last_t, last_rest + "\n" + line, last_is_cont)
+                
+    if not parsed_lines:
+        return ParseResult(
+            status="error",
+            error_message="We couldn't find any WhatsApp messages in this file. Please ensure it is an exported WhatsApp .txt file."
+        )
+        
+    detected_order = detect_date_order(collected_dates)
+    effective_order = override_date_order or detected_order
+    final_date_order = "DMY" if effective_order in ["AMBIGUOUS", "DMY", None] else effective_order
+    
+    messages: List[Message] = []
+    participants_set = set()
+    msg_id = 1
+    
+    for d_str, t_str, rest, _ in parsed_lines:
+        dt = parse_datetime(d_str, t_str, final_date_order)
+        if not dt:
+            continue
+            
+        if ":" in rest:
+            sender, text = rest.split(":", 1)
+            sender = sender.strip()
+            text = text.strip()
+            is_system = False
+            if "Messages and calls are end-to-end encrypted" in sender:
+                is_system = True
+                sender = "System"
+                text = rest.strip()
+            else:
+                participants_set.add(sender)
+        else:
+            sender = "System"
+            text = rest.strip()
+            is_system = True
+            
+        m_type = get_media_type(text)
+        is_media = m_type is not None
+        links = extract_urls(text)
+        emojis = extract_emojis(text)
+        
+        msg = Message(
+            id=msg_id,
+            datetime=dt,
+            sender=sender,
+            text=text,
+            is_media=is_media,
+            media_type=m_type,
+            is_system=is_system,
+            links=links,
+            emojis=emojis
+        )
+        messages.append(msg)
+        msg_id += 1
+        
+    if not messages:
+        return ParseResult(
+            status="error",
+            error_message="Could not parse any valid message timestamps."
+        )
+        
+    participants = sorted(list(participants_set))
+    status = "ambiguous-date" if (detected_order == "AMBIGUOUS" and override_date_order is None) else "ok"
+    
+    return ParseResult(
+        status=status,
+        messages=messages,
+        participants=participants,
+        sample=lines[0] if lines else "",
+        date_order=final_date_order,
+        platform=platform or "android"
+    )
+
+def parse_chat_file(file_bytes_or_str: Any, filename: str = "", override_date_order: Optional[str] = None) -> ParseResult:
+    """Parse a chat from raw bytes, string, or uploaded file object (including .zip)."""
+    if filename.lower().endswith(".zip") or (isinstance(file_bytes_or_str, (bytes, bytearray)) and file_bytes_or_str.startswith(b"PK")):
+        try:
+            if isinstance(file_bytes_or_str, (bytes, bytearray)):
+                z_stream = io.BytesIO(file_bytes_or_str)
+            else:
+                z_stream = file_bytes_or_str
+                
+            with zipfile.ZipFile(z_stream) as z:
+                txt_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+                if not txt_files:
+                    return ParseResult(status="error", error_message="No .txt file found inside the zip archive.")
+                with z.open(txt_files[0]) as f:
+                    raw_content = f.read().decode("utf-8", errors="replace")
+                    return parse_chat(raw_content, override_date_order=override_date_order)
+        except Exception as e:
+            return ParseResult(status="error", error_message=f"Failed to read zip archive: {str(e)}")
+            
+    if isinstance(file_bytes_or_str, bytes):
+        raw_content = file_bytes_or_str.decode("utf-8", errors="replace")
+    elif hasattr(file_bytes_or_str, "read"):
+        content = file_bytes_or_str.read()
+        if isinstance(content, bytes):
+            raw_content = content.decode("utf-8", errors="replace")
+        else:
+            raw_content = str(content)
+    else:
+        raw_content = str(file_bytes_or_str)
+        
+    return parse_chat(raw_content, override_date_order=override_date_order)
+
+import re
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional, Tuple
+
+import pandas as pd
+
+# (embedded models)
+# (embedded stopwords)
+# (embedded extractors)
+
+class StatsCalculator:
+    @staticmethod
+    def calculate(messages: List[Message], user: str = "Overall") -> ChatStats:
+        """Calculate primary top-level statistics for the selected participant."""
+        filtered = [
+            m for m in messages
+            if not m.is_system and (user == "Overall" or m.sender == user)
+        ]
+        
+        if not filtered:
+            return ChatStats(
+                total_messages=0,
+                total_words=0,
+                media_count=0,
+                link_count=0,
+                start_date=None,
+                end_date=None,
+                total_days=0,
+                avg_messages_per_day=0.0
+            )
+            
+        total_messages = len(filtered)
+        total_words = sum(
+            m.word_count for m in filtered if not m.is_media
+        )
+        
+        media_count = sum(1 for m in filtered if m.is_media)
+        link_count = sum(len(m.links) for m in filtered)
+        
+        sorted_dates = sorted(m.datetime for m in filtered)
+        start_date = sorted_dates[0]
+        end_date = sorted_dates[-1]
+        
+        total_days = max((end_date.date() - start_date.date()).days + 1, 1)
+        avg_messages_per_day = round(total_messages / total_days, 1)
+        
+        return ChatStats(
+            total_messages=total_messages,
+            total_words=total_words,
+            media_count=media_count,
+            link_count=link_count,
+            start_date=start_date,
+            end_date=end_date,
+            total_days=total_days,
+            avg_messages_per_day=avg_messages_per_day
+        )
+
+class UserAnalyzer:
+    @staticmethod
+    def rank_participants(messages: List[Message]) -> pd.DataFrame:
+        """Rank participants by message count, word count, avg length, and percentage share."""
+        user_msgs = [m for m in messages if not m.is_system]
+        if not user_msgs:
+            return pd.DataFrame(columns=["User", "Messages", "Words", "Media", "Avg Words/Msg", "Percentage"])
+            
+        total_count = len(user_msgs)
+        user_counts = Counter(m.sender for m in user_msgs)
+        user_words = defaultdict(int)
+        user_media = defaultdict(int)
+        user_text_msgs = defaultdict(int)
+        
+        for m in user_msgs:
+            if not m.is_media:
+                user_words[m.sender] += m.word_count
+                user_text_msgs[m.sender] += 1
+            else:
+                user_media[m.sender] += 1
+                
+        rows = []
+        for sender, count in user_counts.most_common():
+            pct = round((count / total_count) * 100, 1)
+            text_count = user_text_msgs[sender]
+            avg_words = round(user_words[sender] / max(text_count, 1), 1)
+            rows.append({
+                "User": sender,
+                "Messages": count,
+                "Words": user_words[sender],
+                "Media": user_media[sender],
+                "Avg Words/Msg": avg_words,
+                "Percentage": pct
+            })
+            
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def get_participant_details(messages: List[Message], user: str) -> Dict[str, Any]:
+        """Deep dive metrics for a single participant."""
+        user_msgs = [m for m in messages if not m.is_system and m.sender == user]
+        if not user_msgs:
+            return {}
+            
+        total_msgs = len(user_msgs)
+        text_msgs = [m for m in user_msgs if not m.is_media]
+        total_words = sum(m.word_count for m in text_msgs)
+        total_chars = sum(m.char_count for m in text_msgs)
+        media_count = sum(1 for m in user_msgs if m.is_media)
+        links_count = sum(len(m.links) for m in user_msgs)
+        
+        avg_words = round(total_words / max(len(text_msgs), 1), 1)
+        avg_chars = round(total_chars / max(len(text_msgs), 1), 1)
+        
+        hour_counts = Counter(m.hour for m in user_msgs)
+        top_hour = hour_counts.most_common(1)[0][0] if hour_counts else 0
+        top_hour_str = f"{top_hour:02d}:00 - {(top_hour+1)%24:02d}:00"
+        
+        day_counts = Counter(m.weekday_name for m in user_msgs)
+        top_day = day_counts.most_common(1)[0][0] if day_counts else "N/A"
+        
+        return {
+            "total_messages": total_msgs,
+            "total_words": total_words,
+            "avg_words_per_msg": avg_words,
+            "avg_chars_per_msg": avg_chars,
+            "media_count": media_count,
+            "links_count": links_count,
+            "most_active_hour": top_hour_str,
+            "most_active_day": top_day
+        }
+
+class ComparisonAnalyzer:
+    @staticmethod
+    def compare_two_users(messages: List[Message], user1: str, user2: str) -> Dict[str, Any]:
+        """Head-to-head comparison between two participants."""
+        u1_details = UserAnalyzer.get_participant_details(messages, user1)
+        u2_details = UserAnalyzer.get_participant_details(messages, user2)
+        
+        # Calculate reply times between user1 and user2
+        user_msgs = [m for m in messages if not m.is_system and m.sender in [user1, user2]]
+        u1_replies = []
+        u2_replies = []
+        max_delta = timedelta(hours=12)
+        
+        for i in range(1, len(user_msgs)):
+            prev_m = user_msgs[i - 1]
+            curr_m = user_msgs[i]
+            if curr_m.sender != prev_m.sender:
+                diff = curr_m.datetime - prev_m.datetime
+                if timedelta(seconds=0) < diff <= max_delta:
+                    mins = diff.total_seconds() / 60.0
+                    if curr_m.sender == user1:
+                        u1_replies.append(mins)
+                    else:
+                        u2_replies.append(mins)
+                        
+        u1_avg_reply = round(sum(u1_replies) / len(u1_replies), 1) if u1_replies else None
+        u2_avg_reply = round(sum(u2_replies) / len(u2_replies), 1) if u2_replies else None
+        
+        return {
+            "user1": user1,
+            "user2": user2,
+            "user1_stats": {**u1_details, "avg_reply_mins": u1_avg_reply},
+            "user2_stats": {**u2_details, "avg_reply_mins": u2_avg_reply}
+        }
+
+class TimelineAnalyzer:
+    WEEKDAYS_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    MONTHS_ORDER = [
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December"
+    ]
+    
+    @staticmethod
+    def get_monthly_timeline(messages: List[Message], user: str = "Overall") -> pd.DataFrame:
+        filtered = [m for m in messages if not m.is_system and (user == "Overall" or m.sender == user)]
+        if not filtered:
+            return pd.DataFrame(columns=["YearMonth", "MonthYear", "Messages"])
+            
+        counts = Counter(m.datetime.strftime("%Y-%m") for m in filtered)
+        sorted_keys = sorted(counts.keys())
+        
+        data = []
+        for ym in sorted_keys:
+            dt = datetime.strptime(ym, "%Y-%m")
+            label = dt.strftime("%b %Y")
+            data.append({"YearMonth": ym, "MonthYear": label, "Messages": counts[ym]})
+            
+        return pd.DataFrame(data)
+
+    @staticmethod
+    def get_daily_timeline(messages: List[Message], user: str = "Overall") -> pd.DataFrame:
+        filtered = [m for m in messages if not m.is_system and (user == "Overall" or m.sender == user)]
+        if not filtered:
+            return pd.DataFrame(columns=["Date", "Messages"])
+            
+        counts = Counter(m.date_str for m in filtered)
+        sorted_keys = sorted(counts.keys())
+        return pd.DataFrame([{"Date": d, "Messages": counts[d]} for d in sorted_keys])
+
+    @staticmethod
+    def get_hourly_timeline(messages: List[Message], user: str = "Overall") -> pd.DataFrame:
+        filtered = [m for m in messages if not m.is_system and (user == "Overall" or m.sender == user)]
+        counts = Counter(m.hour for m in filtered)
+        data = [{"Hour": f"{h:02d}:00", "Messages": counts.get(h, 0)} for h in range(24)]
+        return pd.DataFrame(data)
+
+    @staticmethod
+    def get_weekday_distribution(messages: List[Message], user: str = "Overall") -> pd.DataFrame:
+        filtered = [m for m in messages if not m.is_system and (user == "Overall" or m.sender == user)]
+        counts = Counter(m.weekday_name for m in filtered)
+        data = [
+            {"Weekday": day, "Messages": counts.get(day, 0)}
+            for day in TimelineAnalyzer.WEEKDAYS_ORDER
+        ]
+        return pd.DataFrame(data)
+
+    @staticmethod
+    def get_month_distribution(messages: List[Message], user: str = "Overall") -> pd.DataFrame:
+        filtered = [m for m in messages if not m.is_system and (user == "Overall" or m.sender == user)]
+        counts = Counter(m.month_name for m in filtered)
+        data = [
+            {"Month": m, "Messages": counts.get(m, 0)}
+            for m in TimelineAnalyzer.MONTHS_ORDER
+        ]
+        return pd.DataFrame(data)
+
+    @staticmethod
+    def get_activity_heatmap(messages: List[Message], user: str = "Overall") -> pd.DataFrame:
+        filtered = [m for m in messages if not m.is_system and (user == "Overall" or m.sender == user)]
+        matrix = {day: [0] * 24 for day in TimelineAnalyzer.WEEKDAYS_ORDER}
+        for m in filtered:
+            if m.weekday_name in matrix and 0 <= m.hour < 24:
+                matrix[m.weekday_name][m.hour] += 1
+        df = pd.DataFrame(matrix).T
+        df.columns = [f"{h:02d}:00" for h in range(24)]
+        return df
+
+class WordAnalyzer:
+    CLEAN_WORD_RE = re.compile(r"^[^\w]+|[^\w]+$", re.UNICODE)
+    
+    @staticmethod
+    def get_word_frequencies(
+        messages: List[Message],
+        user: str = "Overall",
+        remove_stopwords: bool = True,
+        top_n: int = 50
+    ) -> List[Tuple[str, int]]:
+        filtered = [
+            m for m in messages
+            if not m.is_system and not m.is_media and (user == "Overall" or m.sender == user)
+        ]
+        
+        counter = Counter()
+        for m in filtered:
+            text_without_urls = re.sub(r'https?://\S+|www\.\S+', '', m.text)
+            tokens = text_without_urls.split()
+            for token in tokens:
+                word = WordAnalyzer.CLEAN_WORD_RE.sub("", token).lower()
+                if len(word) < 2 or word.isdigit():
+                    continue
+                if remove_stopwords and word in ALL_STOPWORDS:
+                    continue
+                counter[word] += 1
+                
+        return counter.most_common(top_n)
+
+class EmojiAnalyzer:
+    @staticmethod
+    def get_emoji_frequencies(messages: List[Message], user: str = "Overall", top_n: int = 25) -> pd.DataFrame:
+        filtered = [m for m in messages if not m.is_system and (user == "Overall" or m.sender == user)]
+        counter = Counter()
+        for m in filtered:
+            for em in m.emojis:
+                counter[em] += 1
+                
+        total_emojis = sum(counter.values())
+        if total_emojis == 0:
+            return pd.DataFrame(columns=["Emoji", "Count", "Percentage"])
+            
+        rows = []
+        for em, count in counter.most_common(top_n):
+            rows.append({
+                "Emoji": em,
+                "Count": count,
+                "Percentage": round((count / total_emojis) * 100, 1)
+            })
+            
+        return pd.DataFrame(rows)
+
+class SentimentAnalyzer:
+    """Fast rule-based sentiment classifier for English and Roman Urdu / Hinglish messages."""
+    POSITIVE_WORDS = {
+        "good", "great", "awesome", "nice", "excellent", "super", "happy", "love", "thanks", "thank",
+        "perfect", "amazing", "best", "zabardast", "behtareen", "shukriya", "mubarak", "acha", "accha",
+        "sahi", "theek", "khushi", "congrats", "congratulations", "welcome", "yay", "wow", "yes", "superb"
+    }
+    NEGATIVE_WORDS = {
+        "bad", "sad", "sorry", "hate", "terrible", "worst", "angry", "problem", "issue", "error",
+        "fail", "failed", "late", "bura", "kharab", "masla", "pareshan", "ghalat", "nhi", "nahi",
+        "difficult", "tension", "loss", "gussa", "bekaar", "bakwaas", "afsos", "fault"
+    }
+    
+    @staticmethod
+    def analyze_sentiments(messages: List[Message], user: str = "Overall") -> Dict[str, Any]:
+        filtered = [m for m in messages if not m.is_system and not m.is_media and (user == "Overall" or m.sender == user)]
+        if not filtered:
+            return {"positive": 0, "neutral": 0, "negative": 0, "pos_pct": 0, "neu_pct": 100, "neg_pct": 0}
+            
+        pos = 0
+        neg = 0
+        neu = 0
+        
+        for m in filtered:
+            words = set(re.findall(r'\b\w+\b', m.text.lower()))
+            pos_score = len(words.intersection(SentimentAnalyzer.POSITIVE_WORDS))
+            neg_score = len(words.intersection(SentimentAnalyzer.NEGATIVE_WORDS))
+            
+            # Emoji sentiment boosters
+            for em in m.emojis:
+                if em in ["❤️", "😊", "👍", "👍🏽", "🎉", "🔥", "✨", "🙌", "🥳", "☕"]:
+                    pos_score += 1
+                elif em in ["😢", "😭", "💔", "😡", "😞", "👎"]:
+                    neg_score += 1
+                    
+            if pos_score > neg_score:
+                pos += 1
+            elif neg_score > pos_score:
+                neg += 1
+            else:
+                neu += 1
+                
+        total = len(filtered)
+        return {
+            "positive": pos,
+            "neutral": neu,
+            "negative": neg,
+            "total_evaluated": total,
+            "pos_pct": round((pos / total) * 100, 1),
+            "neu_pct": round((neu / total) * 100, 1),
+            "neg_pct": round((neg / total) * 100, 1)
+        }
+
+class MediaAnalyzer:
+    @staticmethod
+    def get_media_breakdown(messages: List[Message], user: str = "Overall") -> pd.DataFrame:
+        filtered = [m for m in messages if not m.is_system and (user == "Overall" or m.sender == user)]
+        media_msgs = [m for m in filtered if m.is_media]
+        
+        counter = Counter()
+        for m in media_msgs:
+            t = m.media_type or "Media"
+            counter[t] += 1
+            
+        if not counter:
+            return pd.DataFrame(columns=["Media Type", "Count", "Percentage"])
+            
+        total = sum(counter.values())
+        rows = [
+            {"Media Type": m_type, "Count": c, "Percentage": round((c / total) * 100, 1)}
+            for m_type, c in counter.most_common()
+        ]
+        return pd.DataFrame(rows)
+
+class SearchAnalyzer:
+    @staticmethod
+    def search_messages(
+        messages: List[Message],
+        query: str = "",
+        user: str = "Overall",
+        date_start: Optional[datetime] = None,
+        date_end: Optional[datetime] = None
+    ) -> List[Message]:
+        results = []
+        q_lower = query.strip().lower()
+        
+        for m in messages:
+            if m.is_system:
+                continue
+            if user != "Overall" and m.sender != user:
+                continue
+            if date_start and m.datetime.date() < date_start.date():
+                continue
+            if date_end and m.datetime.date() > date_end.date():
+                continue
+            if q_lower and q_lower not in m.text.lower():
+                continue
+            results.append(m)
+            
+        return results
+
+class InsightAnalyzer:
+    @staticmethod
+    def get_conversation_starters(messages: List[Message], gap_hours: float = 6.0) -> pd.DataFrame:
+        user_msgs = [m for m in messages if not m.is_system]
+        if not user_msgs:
+            return pd.DataFrame(columns=["User", "Starts", "Percentage"])
+            
+        starters = Counter()
+        gap_delta = timedelta(hours=gap_hours)
+        starters[user_msgs[0].sender] += 1
+        
+        for i in range(1, len(user_msgs)):
+            prev_m = user_msgs[i - 1]
+            curr_m = user_msgs[i]
+            if curr_m.datetime - prev_m.datetime >= gap_delta:
+                starters[curr_m.sender] += 1
+                
+        total_starts = sum(starters.values())
+        rows = []
+        for sender, count in starters.most_common():
+            rows.append({
+                "User": sender,
+                "Starts": count,
+                "Percentage": round((count / total_starts) * 100, 1) if total_starts else 0
+            })
+            
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def get_average_reply_time(messages: List[Message], max_reply_hours: float = 12.0) -> pd.DataFrame:
+        user_msgs = [m for m in messages if not m.is_system]
+        if len(user_msgs) < 2:
+            return pd.DataFrame(columns=["User", "Average Reply Time (mins)", "Replies Count"])
+            
+        reply_times = defaultdict(list)
+        max_delta = timedelta(hours=max_reply_hours)
+        
+        for i in range(1, len(user_msgs)):
+            prev_m = user_msgs[i - 1]
+            curr_m = user_msgs[i]
+            
+            if curr_m.sender != prev_m.sender:
+                diff = curr_m.datetime - prev_m.datetime
+                if timedelta(seconds=0) < diff <= max_delta:
+                    minutes = diff.total_seconds() / 60.0
+                    reply_times[curr_m.sender].append(minutes)
+                    
+        rows = []
+        for sender, times in reply_times.items():
+            if times:
+                avg_time = round(sum(times) / len(times), 1)
+                rows.append({
+                    "User": sender,
+                    "Average Reply Time (mins)": avg_time,
+                    "Replies Count": len(times)
+                })
+                
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = df.sort_values(by="Average Reply Time (mins)")
+        return df
+
+    @staticmethod
+    def get_longest_streak(messages: List[Message]) -> int:
+        user_msgs = [m for m in messages if not m.is_system]
+        if not user_msgs:
+            return 0
+            
+        unique_days = sorted(list(set(m.datetime.date() for m in user_msgs)))
+        if not unique_days:
+            return 0
+            
+        longest = 1
+        current = 1
+        
+        for i in range(1, len(unique_days)):
+            if unique_days[i] == unique_days[i - 1] + timedelta(days=1):
+                current += 1
+                if current > longest:
+                    longest = current
+            else:
+                current = 1
+                
+        return longest
+
+    @staticmethod
+    def get_top_domains(messages: List[Message], user: str = "Overall", top_n: int = 15) -> pd.DataFrame:
+        filtered = [m for m in messages if not m.is_system and (user == "Overall" or m.sender == user)]
+        all_links = []
+        for m in filtered:
+            all_links.extend(m.links)
+            
+        domains = extract_domains(all_links)
+        counter = Counter(domains)
+        
+        if not counter:
+            return pd.DataFrame(columns=["Domain", "Count"])
+            
+        rows = [{"Domain": d, "Count": c} for d, c in counter.most_common(top_n)]
+        return pd.DataFrame(rows)
+
+def analyze_chat(messages: List[Message], user: str = "Overall", remove_stopwords: bool = True) -> Dict[str, Any]:
+    """Convenience pipeline executing all analyzers for a given user filter."""
+    return {
+        "stats": StatsCalculator.calculate(messages, user),
+        "user_ranks": UserAnalyzer.rank_participants(messages),
+        "monthly_timeline": TimelineAnalyzer.get_monthly_timeline(messages, user),
+        "daily_timeline": TimelineAnalyzer.get_daily_timeline(messages, user),
+        "hourly_timeline": TimelineAnalyzer.get_hourly_timeline(messages, user),
+        "weekday_dist": TimelineAnalyzer.get_weekday_distribution(messages, user),
+        "month_dist": TimelineAnalyzer.get_month_distribution(messages, user),
+        "heatmap": TimelineAnalyzer.get_activity_heatmap(messages, user),
+        "words": WordAnalyzer.get_word_frequencies(messages, user, remove_stopwords=remove_stopwords),
+        "emojis": EmojiAnalyzer.get_emoji_frequencies(messages, user),
+        "media_breakdown": MediaAnalyzer.get_media_breakdown(messages, user),
+        "sentiments": SentimentAnalyzer.analyze_sentiments(messages, user),
+        "starters": InsightAnalyzer.get_conversation_starters(messages),
+        "reply_times": InsightAnalyzer.get_average_reply_time(messages),
+        "longest_streak": InsightAnalyzer.get_longest_streak(messages),
+        "top_domains": InsightAnalyzer.get_top_domains(messages, user)
+    }
+# ==============================================================================
+# END EMBEDDED ENGINE
+# ==============================================================================
 
 # Page configuration
 st.set_page_config(
