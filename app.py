@@ -8,7 +8,24 @@ Matches the exact pixel layout from the reference image (media_1792003835526.png
 - Full-bleed Bottom Dark Teal Banner (#075E54) with Instant Insights summary text
 - Full WhatsApp Dashboard with Overview, Participants, Sentiments & Words, Activity, Chat Breakdown
 """
+import os
+import sys
+import zipfile
 
+# Ensure current repository root is in Python sys.path on Streamlit Cloud & remote servers
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+# Auto-extract package if uploaded as zip to GitHub/Streamlit Cloud
+_PKG_DIR = os.path.join(_REPO_ROOT, "whatsapp_analyzer")
+_ZIP_FILE = os.path.join(_REPO_ROOT, "whatsapp_chat_analyzer_deploy.zip")
+if not os.path.exists(_PKG_DIR) and os.path.exists(_ZIP_FILE):
+    try:
+        with zipfile.ZipFile(_ZIP_FILE, "r") as _z:
+            _z.extractall(_REPO_ROOT)
+    except Exception:
+        pass
 import io
 import json
 import base64
